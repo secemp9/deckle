@@ -1,0 +1,8 @@
+{
+  "productName": "Deckle Dev",
+  "identifier": "design.deckle.desktop.dev",
+  "build": {
+    "beforeBuildCommand": "",
+    "frontendDist": "./webapp"
+  }
+}

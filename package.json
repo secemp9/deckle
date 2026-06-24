@@ -1,0 +1,11 @@
+{
+  "name": "deckle-desktop",
+  "version": "0.4.2",
+  "private": true,
+  "scripts": {
+    "build": "node build.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

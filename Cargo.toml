@@ -1,0 +1,76 @@
+[package]
+name = "deckle-desktop"
+version = "0.4.2"
+edition = "2021"
+description = "Deckle Desktop — offline-capable design tool (Rust port)"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.52.3", features = ["full"] }
+
+# HTTP framework
+axum = { version = "0.8.9", features = ["ws"] }
+
+# Tower service combinators (Layer trait for middleware wrapping)
+tower = "0.5"
+
+# HTTP middleware (static files, CORS)
+tower-http = { version = "0.7.0", features = ["fs", "cors"] }
+
+# Async stream utilities (ReaderStream for file serving)
+tokio-util = { version = "0.7", features = ["io"] }
+
+# URL percent-decoding
+urlencoding = "2.1"
+
+# MCP server (Model Context Protocol)
+rmcp = { version = "1.7.0", features = ["server", "macros", "transport-streamable-http-server"] }
+
+# Insertion-ordered maps (matches Node.js object key ordering)
+indexmap = { version = "2", features = ["serde"] }
+
+# SHA-256 hashing for token auth (parity with Electron's crypto.createHash)
+sha2 = "0.11"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_repr = "0.1"
+
+# UUID generation
+uuid = { version = "1.23.3", features = ["v4"] }
+
+# Async trait support (for rmcp's SessionStore)
+async-trait = "0.1"
+
+# Platform directories (~/.deckle-local)
+dirs = "6.0.0"
+
+# Embed static webapp assets into the binary
+rust-embed = "8.11.0"
+
+# Open URLs in the system browser
+open = "5"
+
+# System clipboard access (read HTML from clipboard for paste bridging)
+arboard = "3"
+
+# Structured logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Tauri webview shell (requires webkit2gtk-4.1 on Linux)
+tauri = { version = "2.11.3", features = ["wry", "devtools"] }
+
+# Single-instance plugin — detects second instance launches and focuses existing window
+# (mirrors Electron's app.requestSingleInstanceLock + second-instance event)
+tauri-plugin-single-instance = "2"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
