@@ -2,7 +2,11 @@
 name = "deckle-desktop"
 version = "0.4.2"
 edition = "2021"
-description = "Deckle Desktop — offline-capable design tool (Rust port)"
+license = "MIT"
+repository = "https://github.com/secemp9/deckle"
+description = "Deckle — open-source UI design tool with MCP server for AI agents"
+keywords = ["design", "ui", "tauri", "mcp", "desktop"]
+categories = ["gui"]
 
 [dependencies]
 # Async runtime
