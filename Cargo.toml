@@ -1,6 +1,6 @@
 [package]
 name = "deckle-desktop"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/secemp9/deckle"
@@ -28,7 +28,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 urlencoding = "2.1"
 
 # MCP server (Model Context Protocol)
-rmcp = { version = "1.7.0", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "1.7.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 
 # Insertion-ordered maps (matches Node.js object key ordering)
 indexmap = { version = "2", features = ["serde"] }
@@ -62,6 +62,9 @@ arboard = "3"
 # Structured logging
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
 
 # Tauri webview shell (requires webkit2gtk-4.1 on Linux)
 tauri = { version = "2.11.3", features = ["wry", "devtools"] }

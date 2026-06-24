@@ -400,7 +400,7 @@ impl McpBridge for WebviewBridge {
 
 /// The MCP server handler. Each session gets its own instance (created by the
 /// service factory closure), but they all share the same bridge.
-struct DeckleMcpHandler {
+pub struct DeckleMcpHandler {
     bridge: Arc<dyn McpBridge>,
     /// Cached tool definitions, loaded once when the handler is created.
     tools: Vec<Tool>,
@@ -990,6 +990,27 @@ pub async fn start(
         .await?;
 
     Ok(())
+}
+
+/// Create a standalone `DeckleMcpHandler` ready for stdio serving.
+///
+/// This builds a handler backed by [`StandaloneBridge`] (static tool
+/// definitions, no webview required). The returned handler implements
+/// [`rmcp::ServiceExt`] so you can serve it over any transport:
+///
+/// ```rust,no_run
+/// use rmcp::ServiceExt as _;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let handler = deckle::mcp_server::create_standalone_handler().await;
+/// let service = handler.serve(rmcp::transport::io::stdio()).await?;
+/// service.waiting().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn create_standalone_handler() -> DeckleMcpHandler {
+    let bridge: Arc<dyn McpBridge> = Arc::new(StandaloneBridge::new());
+    DeckleMcpHandler::new(bridge).await
 }
 
 // ---------------------------------------------------------------------------

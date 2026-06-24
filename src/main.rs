@@ -8,6 +8,7 @@ mod types;
 
 use std::sync::Arc;
 
+use clap::Parser;
 use file_store::FileStore;
 use mcp_server::{McpBridgeState, WebviewBridge};
 use serde_json::Value;
@@ -15,7 +16,26 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::Emitter;
 use tauri::Manager;
 
+#[derive(Parser)]
+#[command(name = "deckle-desktop", version, about = "Deckle — open-source UI design tool")]
+struct Cli {
+    /// Run MCP server over stdin/stdout (for Claude Code, Cursor, etc.)
+    #[arg(long)]
+    mcp: bool,
+
+    /// Port for the HTTP MCP server
+    #[arg(long, default_value_t = 29979)]
+    mcp_port: u16,
+
+    /// Run without a visible window (headless mode)
+    #[arg(long)]
+    headless: bool,
+}
+
 fn main() {
+    let cli = Cli::parse();
+    let mcp_port = cli.mcp_port;
+
     // Initialize structured logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -26,8 +46,35 @@ fn main() {
 
     tracing::info!("Deckle Desktop v{} starting...", env!("CARGO_PKG_VERSION"));
 
-    // Read headless mode env var (mirrors Electron's DECKLE_HEADLESS_MCP support).
-    let is_headless_mcp = std::env::var("DECKLE_HEADLESS_MCP").as_deref() == Ok("true");
+    // ── stdio MCP mode ─────────────────────────────────────────────────
+    // If --mcp is set, run a pure-tokio MCP server over stdin/stdout
+    // without ever touching Tauri, GTK, or a webview. We create our own
+    // tokio runtime here because Tauri hasn't built one yet (it creates
+    // its own when you call .build()/.run()).
+    //
+    // tracing output goes to stderr by default, which is correct for
+    // stdio MCP (stdout is reserved for JSON-RPC messages).
+    if cli.mcp {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            use rmcp::ServiceExt;
+            let handler = mcp_server::create_standalone_handler().await;
+            tracing::info!("Deckle MCP server running over stdio");
+            match handler.serve(rmcp::transport::io::stdio()).await {
+                Ok(service) => {
+                    let _ = service.waiting().await;
+                }
+                Err(e) => {
+                    tracing::error!("MCP stdio server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+        return;
+    }
+
+    // Read headless mode from CLI flag or env var (mirrors Electron's DECKLE_HEADLESS_MCP support).
+    let is_headless_mcp = cli.headless || std::env::var("DECKLE_HEADLESS_MCP").as_deref() == Ok("true");
     if is_headless_mcp {
         tracing::info!(
             "DECKLE_HEADLESS_MCP=true — running in headless MCP mode (no visible window). \
@@ -116,14 +163,14 @@ fn main() {
             let bridge_state = McpBridgeState::new_arc();
             app.manage(bridge_state.clone());
 
-            // Start the MCP server on port 29979 with the WebviewBridge.
+            // Start the MCP server on the configured port with the WebviewBridge.
             // If the webview window hasn't been created yet, the bridge will
             // return static tool definitions and "editor not ready" errors,
             // matching the Electron behavior.
             let app_handle_for_mcp = app.handle().clone();
             let bridge = Arc::new(WebviewBridge::new(app_handle_for_mcp, bridge_state));
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = mcp_server::start(29979, bridge, mcp_shutdown).await {
+                if let Err(e) = mcp_server::start(mcp_port, bridge, mcp_shutdown).await {
                     tracing::error!("MCP server failed: {}", e);
                     std::process::exit(1);
                 }
