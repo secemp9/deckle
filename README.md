@@ -8,7 +8,22 @@ Open-source UI design tool with a built-in MCP server for AI agents (Claude Code
 cargo install deckle-desktop
 ```
 
-Requires Rust 1.70+. On Linux, you also need `webkit2gtk-4.1` development libraries.
+Requires Rust 1.70+. On Linux, install the build dependencies first:
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+```
+
+**Fedora:**
+```bash
+sudo dnf install webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel librsvg2-devel patchelf
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg patchelf
+```
 
 ## Claude Code MCP Setup
 
