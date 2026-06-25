@@ -1,6 +1,6 @@
 [package]
 name = "deckle-desktop"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/secemp9/deckle"
@@ -58,6 +58,9 @@ open = "5"
 
 # System clipboard access (read HTML from clipboard for paste bridging)
 arboard = "3"
+
+# HTTP client for --mcp stdio proxy mode (forwards tool calls to the GUI's HTTP MCP server)
+reqwest = { version = "0.12", features = ["json"] }
 
 # Structured logging
 tracing = "0.1.44"

@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use axum::{
-    extract::Request,
+    extract::{Request, State as AxumState},
     http,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -43,7 +43,7 @@ use rmcp::{
     },
     ServerHandler,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
@@ -64,6 +64,7 @@ pub struct McpToolResult {
     /// Content items to return to the MCP client.
     pub content: Vec<Content>,
     /// Whether the result represents an error condition.
+    #[serde(default)]
     pub is_error: bool,
 }
 
@@ -162,6 +163,226 @@ impl McpBridge for StandaloneBridge {
         _level: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async {})
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProxyBridge — forwards tool calls to the GUI's HTTP MCP server
+// ---------------------------------------------------------------------------
+
+/// Request/response types for the internal REST proxy endpoints.
+#[derive(Serialize, Deserialize)]
+struct InternalCallToolRequest {
+    session_id: String,
+    name: String,
+    args: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InternalRemoveAgentRequest {
+    session_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InternalLogRequest {
+    message: String,
+    level: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InternalServerConfigResponse {
+    instructions: Option<String>,
+    tools: Vec<Tool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InternalCallToolResponse {
+    content: Vec<Content>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Bridge implementation that proxies all calls to the GUI process's internal
+/// REST endpoints on the MCP server port. Used by `--mcp` stdio mode so
+/// Claude Code can spawn a lightweight stdio process while the actual tool
+/// execution happens in the running GUI process with its webview.
+pub struct ProxyBridge {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl ProxyBridge {
+    /// Create a proxy bridge that forwards to the given port.
+    pub fn new(port: u16) -> Self {
+        Self {
+            base_url: format!("http://127.0.0.1:{}", port),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
+        }
+    }
+
+    /// Wait for the GUI's internal endpoint to be reachable. Polls every 500ms
+    /// for up to `max_wait` seconds. Returns true if the server responded.
+    pub async fn wait_for_gui(&self, max_wait_secs: u32) -> bool {
+        let url = format!("{}/internal/server-config", self.base_url);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(max_wait_secs as u64);
+
+        loop {
+            match self.client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!(
+                        "[mcp-proxy] GUI MCP server at {} is reachable",
+                        self.base_url
+                    );
+                    return true;
+                }
+                Ok(resp) => {
+                    tracing::debug!(
+                        "[mcp-proxy] GUI responded with status {} — retrying",
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("[mcp-proxy] GUI not reachable yet: {}", e);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "[mcp-proxy] Timed out after {}s waiting for GUI MCP server at {}",
+                    max_wait_secs,
+                    self.base_url
+                );
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+impl McpBridge for ProxyBridge {
+    fn get_server_config(&self) -> Pin<Box<dyn Future<Output = McpServerConfig> + Send>> {
+        let url = format!("{}/internal/server-config", self.base_url);
+        let client = self.client.clone();
+        Box::pin(async move {
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<InternalServerConfigResponse>().await {
+                        Ok(config) => McpServerConfig {
+                            instructions: config.instructions,
+                            tools: config.tools,
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "[mcp-proxy] Failed to parse server config response: {}; using static config",
+                                e
+                            );
+                            McpServerConfig {
+                                instructions: Some(INSTRUCTIONS.to_string()),
+                                tools: build_static_tools(),
+                            }
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        "[mcp-proxy] Server config returned status {}; using static config",
+                        resp.status()
+                    );
+                    McpServerConfig {
+                        instructions: Some(INSTRUCTIONS.to_string()),
+                        tools: build_static_tools(),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[mcp-proxy] Failed to reach GUI for server config: {}; using static config",
+                        e
+                    );
+                    McpServerConfig {
+                        instructions: Some(INSTRUCTIONS.to_string()),
+                        tools: build_static_tools(),
+                    }
+                }
+            }
+        })
+    }
+
+    fn call_tool(
+        &self,
+        session_id: &str,
+        name: &str,
+        args: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<McpToolResult, String>> + Send>> {
+        let url = format!("{}/internal/call-tool", self.base_url);
+        let client = self.client.clone();
+        let body = InternalCallToolRequest {
+            session_id: session_id.to_string(),
+            name: name.to_string(),
+            args,
+        };
+        Box::pin(async move {
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Cannot reach Deckle Desktop GUI. Make sure the Deckle Desktop app is \
+                         running, then try again. ({})",
+                        e
+                    )
+                })?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Deckle GUI returned error (HTTP {}): {}",
+                    status, text
+                ));
+            }
+
+            let result: InternalCallToolResponse = resp.json().await.map_err(|e| {
+                format!("Failed to parse tool call response from Deckle GUI: {}", e)
+            })?;
+            Ok(McpToolResult {
+                content: result.content,
+                is_error: result.is_error,
+            })
+        })
+    }
+
+    fn remove_agent(&self, session_id: &str) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let url = format!("{}/internal/remove-agent", self.base_url);
+        let client = self.client.clone();
+        let body = InternalRemoveAgentRequest {
+            session_id: session_id.to_string(),
+        };
+        Box::pin(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        })
+    }
+
+    fn mcp_log(
+        &self,
+        message: &str,
+        level: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let url = format!("{}/internal/log", self.base_url);
+        let client = self.client.clone();
+        let body = InternalLogRequest {
+            message: message.to_string(),
+            level: level.map(|s| s.to_string()),
+        };
+        Box::pin(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        })
     }
 }
 
@@ -402,8 +623,10 @@ impl McpBridge for WebviewBridge {
 /// service factory closure), but they all share the same bridge.
 pub struct DeckleMcpHandler {
     bridge: Arc<dyn McpBridge>,
-    /// Cached tool definitions, loaded once when the handler is created.
-    tools: Vec<Tool>,
+    /// Fallback tool definitions, used only if a dynamic fetch fails.
+    /// When the bridge can reach the webapp, `list_tools()` fetches fresh
+    /// schemas directly from the JS so they always match the Zod definitions.
+    fallback_tools: Vec<Tool>,
     /// Cached instructions text.
     instructions: Option<String>,
     /// The session ID, recorded from the first request so it can be used in
@@ -416,7 +639,7 @@ impl DeckleMcpHandler {
         let config = bridge.get_server_config().await;
         Self {
             bridge,
-            tools: config.tools,
+            fallback_tools: config.tools,
             instructions: config.instructions,
             session_id: Mutex::new(None),
         }
@@ -451,8 +674,24 @@ impl ServerHandler for DeckleMcpHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
     {
-        let tools = self.tools.clone();
-        async move { Ok(ListToolsResult::with_all_items(tools)) }
+        let bridge = self.bridge.clone();
+        let fallback = self.fallback_tools.clone();
+        async move {
+            // Always fetch fresh tool schemas from the bridge so they match
+            // the webapp's Zod definitions. The bridge calls through to the
+            // GUI's getMCPServerConfig() which returns the real schemas. If
+            // the bridge can't reach the webapp it falls back to static defs.
+            let config = bridge.get_server_config().await;
+            let tools = if config.tools.is_empty() {
+                tracing::debug!(
+                    "[mcp-server] Dynamic tool fetch returned empty; using fallback tools"
+                );
+                fallback
+            } else {
+                config.tools
+            };
+            Ok(ListToolsResult::with_all_items(tools))
+        }
     }
 
     fn call_tool(
@@ -497,6 +736,10 @@ impl ServerHandler for DeckleMcpHandler {
                     Some("info"),
                 )
                 .await;
+
+            // Tool schemas are now fetched dynamically from the webapp, so
+            // args arrive with the correct camelCase keys matching the JS Zod
+            // schemas. No snake_to_camel conversion needed.
 
             match bridge.call_tool(&session_id, &tool_name, args).await {
                 Ok(result) => {
@@ -875,6 +1118,66 @@ impl SessionStore for ResurrectionStore {
 }
 
 // ---------------------------------------------------------------------------
+// Internal REST endpoints — used by ProxyBridge in --mcp stdio mode
+// ---------------------------------------------------------------------------
+
+/// Handler for `GET /internal/server-config` — returns tool definitions and
+/// instructions from the bridge.
+async fn internal_server_config(
+    AxumState(bridge): AxumState<Arc<dyn McpBridge>>,
+) -> axum::Json<Value> {
+    let config = bridge.get_server_config().await;
+    // Serialize tools via serde_json since Tool implements Serialize.
+    let tools_val = serde_json::to_value(&config.tools).unwrap_or(json!([]));
+    axum::Json(json!({
+        "instructions": config.instructions,
+        "tools": tools_val,
+    }))
+}
+
+/// Handler for `POST /internal/call-tool` — forwards a tool call through
+/// the bridge to the webview.
+async fn internal_call_tool(
+    AxumState(bridge): AxumState<Arc<dyn McpBridge>>,
+    axum::Json(body): axum::Json<InternalCallToolRequest>,
+) -> Response {
+    match bridge.call_tool(&body.session_id, &body.name, body.args).await {
+        Ok(result) => axum::Json(json!({
+            "content": result.content,
+            "isError": result.is_error,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// Handler for `POST /internal/remove-agent` — notifies the editor that
+/// a session has ended.
+async fn internal_remove_agent(
+    AxumState(bridge): AxumState<Arc<dyn McpBridge>>,
+    axum::Json(body): axum::Json<InternalRemoveAgentRequest>,
+) -> StatusCode {
+    bridge.remove_agent(&body.session_id).await;
+    StatusCode::NO_CONTENT
+}
+
+/// Handler for `POST /internal/log` — forwards a log message to the editor
+/// console.
+async fn internal_log(
+    AxumState(bridge): AxumState<Arc<dyn McpBridge>>,
+    axum::Json(body): axum::Json<InternalLogRequest>,
+) -> StatusCode {
+    bridge
+        .mcp_log(&body.message, body.level.as_deref())
+        .await;
+    StatusCode::NO_CONTENT
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -889,15 +1192,17 @@ pub async fn start(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ct = shutdown;
 
-    // The service factory creates a new DeckleMcpHandler for each session.
-    // We need to block on getting the config once so the factory closure
-    // can clone it without being async.
+    // Fetch an initial config to use as fallback for the factory closure.
+    // The factory is synchronous (FnMut -> Result<Handler>), so it can't
+    // call async get_server_config(). Instead, each handler's list_tools()
+    // fetches fresh schemas dynamically from the bridge. The fallback is
+    // only used if that dynamic fetch fails.
     let initial_config = bridge.get_server_config().await;
-    let shared_tools = Arc::new(initial_config.tools);
+    let shared_fallback_tools = Arc::new(initial_config.tools);
     let shared_instructions = Arc::new(initial_config.instructions);
 
     let bridge_for_factory = bridge.clone();
-    let tools_for_factory = shared_tools.clone();
+    let fallback_tools_for_factory = shared_fallback_tools.clone();
     let instructions_for_factory = shared_instructions.clone();
 
     // Build the config using the builder, then set session_store directly
@@ -928,7 +1233,7 @@ pub async fn start(
             move || {
                 let handler = DeckleMcpHandler {
                     bridge: bridge_for_factory.clone(),
-                    tools: (*tools_for_factory).clone(),
+                    fallback_tools: (*fallback_tools_for_factory).clone(),
                     instructions: (*instructions_for_factory).clone(),
                     session_id: Mutex::new(None),
                 };
@@ -944,10 +1249,32 @@ pub async fn start(
     // between StreamableHttpService and axum's FromFn extractor macro.
     let auth_service = BearerTokenService { inner: service };
 
+    // Internal REST routes for the ProxyBridge (--mcp stdio mode).
+    // These bypass the MCP protocol and call the bridge directly.
+    // They are only accessible from localhost and are NOT exposed to
+    // external MCP clients (separate route prefix, no /mcp path).
+    let internal_routes = Router::new()
+        .route(
+            "/internal/server-config",
+            axum::routing::get(internal_server_config),
+        )
+        .route(
+            "/internal/call-tool",
+            axum::routing::post(internal_call_tool),
+        )
+        .route(
+            "/internal/remove-agent",
+            axum::routing::post(internal_remove_agent),
+        )
+        .route("/internal/log", axum::routing::post(internal_log))
+        .with_state(bridge.clone());
+
     // Build the axum router.
     let app = Router::new()
         // Mount the MCP service at /mcp.
         .nest_service("/mcp", auth_service)
+        // Internal REST endpoints for stdio proxy mode.
+        .merge(internal_routes)
         // OAuth/OIDC discovery endpoints — return bare 404 to prevent
         // Claude Code from misclassifying this server as an OAuth provider.
         .route(
@@ -984,6 +1311,9 @@ pub async fn start(
     tracing::info!(
         "[mcp-server]   POST /mcp - JSON-RPC; GET /mcp - SSE stream; DELETE /mcp - session cleanup"
     );
+    tracing::info!(
+        "[mcp-server]   Internal proxy endpoints available at /internal/*"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { ct.cancelled().await })
@@ -1013,6 +1343,32 @@ pub async fn create_standalone_handler() -> DeckleMcpHandler {
     DeckleMcpHandler::new(bridge).await
 }
 
+/// Create a proxy `DeckleMcpHandler` that forwards tool calls to the
+/// running GUI process's HTTP MCP server.
+///
+/// The proxy connects to `http://127.0.0.1:{port}/internal/*` endpoints
+/// exposed by the GUI process. If the GUI is not yet running, this will
+/// wait up to `wait_secs` seconds for it to become available.
+///
+/// If the GUI cannot be reached within the timeout, the handler falls back
+/// to using static tool definitions (so `list_tools` still works) but tool
+/// calls will return an error asking the user to start Deckle Desktop.
+pub async fn create_proxy_handler(port: u16, _wait_secs: u32) -> DeckleMcpHandler {
+    let proxy = ProxyBridge::new(port);
+
+    tracing::info!(
+        "[mcp-proxy] Deckle MCP proxy targeting GUI at http://127.0.0.1:{}",
+        port
+    );
+
+    // Start serving stdio immediately — don't block waiting for the GUI.
+    // The proxy bridge handles GUI-not-running gracefully: get_server_config()
+    // falls back to static tool definitions, and call_tool() returns a clear
+    // error asking the user to start Deckle Desktop.
+    let bridge: Arc<dyn McpBridge> = Arc::new(proxy);
+    DeckleMcpHandler::new(bridge).await
+}
+
 // ---------------------------------------------------------------------------
 // Static tool definitions
 // ---------------------------------------------------------------------------
@@ -1032,14 +1388,17 @@ You MUST load the full guide before other Deckle tools: get_guide({ topic: "deck
 - User-facing output: do not include raw node IDs.
 - Export to the user's codebase: use get_jsx, get_computed_styles, get_fill_image, etc. for exact values — do not read sizes or colors from screenshots alone."#;
 
-/// Build the 30 static tool definitions that mirror the Deckle webapp's MCP handler.
-/// These are returned when the webview bridge is not connected so that AI clients
-/// can still see the tool catalog.
+/// Build static tool definitions that approximate the Deckle webapp's MCP handler.
+///
+/// These are used as FALLBACK when the webapp is not reachable (e.g. the GUI
+/// hasn't started yet). When the webapp IS reachable, `list_tools()` fetches
+/// the real Zod-derived schemas dynamically and these are never used.
+///
+/// IMPORTANT: Parameter names use camelCase to match the webapp's Zod schemas.
+/// Do NOT use snake_case here — Claude Code sends args matching the schema keys,
+/// and the webapp validates them as-is.
 fn build_static_tools() -> Vec<Tool> {
     // Helper to create a tool with a JSON Schema input.
-    // Mirrors the TS webapp's Zod-to-JSON-Schema output which always includes
-    // `$schema` (draft-2020-12) and `additionalProperties: false` on every
-    // root-level object schema.
     fn tool(name: &str, description: &str, schema: Value) -> Tool {
         let mut input_schema: serde_json::Map<String, Value> = match schema {
             Value::Object(map) => map,
@@ -1049,7 +1408,6 @@ fn build_static_tools() -> Vec<Tool> {
                 m
             }
         };
-        // Match the TS server's Zod-to-JSON-Schema output format.
         input_schema
             .entry("$schema".to_string())
             .or_insert_with(|| json!("https://json-schema.org/draft/2020-12/schema"));
@@ -1063,12 +1421,10 @@ fn build_static_tools() -> Vec<Tool> {
         )
     }
 
-    // Annotation helpers matching the original webapp's MCPHandlers.
     let read_only = || ToolAnnotations::new().read_only(true);
     let destructive = || ToolAnnotations::new().destructive(true);
 
     vec![
-        // get_guide has no annotation in the original
         tool(
             "get_guide",
             "Load the Deckle MCP guide. You MUST call this before using any other Deckle tools. Pass topic: \"deckle-mcp-instructions\" for the full guide.",
@@ -1088,12 +1444,7 @@ fn build_static_tools() -> Vec<Tool> {
         tool(
             "get_selection",
             "Get information about the current user selection in the editor.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "include_ancestors": { "type": "boolean", "description": "Include ancestor nodes in the response" }
-                }
-            }),
+            json!({ "type": "object", "properties": {} }),
         ).with_annotations(read_only()),
         tool(
             "get_node_info",
@@ -1101,10 +1452,9 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The ID of the node to inspect" },
-                    "include_children": { "type": "boolean" }
+                    "nodeId": { "type": "string", "description": "The ID of the node to inspect" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1113,10 +1463,9 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The ID of the parent node" },
-                    "depth": { "type": "number", "description": "How many levels deep to traverse" }
+                    "nodeId": { "type": "string", "description": "The ID of the parent node" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1125,11 +1474,11 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The ID of the node to capture" },
-                    "scale": { "type": "number", "description": "Scale factor for the screenshot (default 1)" },
-                    "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Image format" }
+                    "nodeId": { "type": "string", "description": "The ID of the node to capture" },
+                    "transparent": { "type": "boolean", "description": "Whether to use a transparent background" },
+                    "scale": { "type": "number", "description": "Scale factor for the screenshot (default 1)" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1138,9 +1487,10 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The ID of the node to export" }
+                    "nodeId": { "type": "string", "description": "The ID of the node to export" },
+                    "format": { "type": "string", "enum": ["tailwind", "inline-styles"], "description": "Output format" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1149,10 +1499,10 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The root node ID" },
+                    "nodeId": { "type": "string", "description": "The root node ID" },
                     "depth": { "type": "number", "description": "Maximum depth to traverse" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1161,14 +1511,13 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "nodeIds": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Array of node IDs to get styles for"
-                    },
-                    "format": { "type": "string", "enum": ["css", "tailwind"] }
+                    }
                 },
-                "required": ["node_ids"]
+                "required": ["nodeIds"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1177,20 +1526,24 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The ID of the node with an image fill" }
+                    "nodeId": { "type": "string", "description": "The ID of the node with an image fill" }
                 },
-                "required": ["node_id"]
+                "required": ["nodeId"]
             }),
         ).with_annotations(read_only()),
         tool(
             "get_font_family_info",
-            "Get detailed information about a font family, including available weights and styles. You MUST call this before your first typographic styling in a session.",
+            "Get detailed information about font families, including available weights and styles. You MUST call this before your first typographic styling in a session.",
             json!({
                 "type": "object",
                 "properties": {
-                    "family": { "type": "string", "description": "The font family name to look up" }
+                    "familyNames": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Names of the font families to look up."
+                    }
                 },
-                "required": ["family"]
+                "required": ["familyNames"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1199,9 +1552,13 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "file_id": { "type": "string", "description": "The file ID or Deckle URL to open" }
+                    "fileId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The Paper file ID to open. Accepts a bare ID, a /file/<id> route path, or a full https URL pointing at the file."
+                    }
                 },
-                "required": ["file_id"]
+                "required": ["fileId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1210,7 +1567,7 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "number", "description": "Maximum number of files to return (default 50)" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum number of files to return (default 50)" }
                 }
             }),
         ).with_annotations(read_only()),
@@ -1220,8 +1577,8 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "file_name": { "type": "string", "description": "Name for the new file" },
-                    "clone_file_id": { "type": "string", "description": "Optional file ID to clone from" }
+                    "cloneFileId": { "type": "string", "description": "Optional file ID to clone from" },
+                    "name": { "type": "string", "description": "Name for the new file" }
                 }
             }),
         ).with_annotations(destructive()),
@@ -1231,9 +1588,9 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "description": "The ID of the page to open" }
+                    "pageId": { "type": "string", "minLength": 1, "description": "The ID of the page to open" }
                 },
-                "required": ["page_id"]
+                "required": ["pageId"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1253,10 +1610,10 @@ fn build_static_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "html": { "type": "string", "description": "The HTML to write into the design" },
-                    "parent_id": { "type": "string", "description": "The parent node ID to insert into" },
+                    "targetNodeId": { "type": "string", "description": "The target node ID to insert into" },
                     "mode": { "type": "string", "enum": ["insert-children", "replace"], "description": "Insert mode" }
                 },
-                "required": ["html", "parent_id"]
+                "required": ["html", "targetNodeId", "mode"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1265,12 +1622,18 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Name for the artboard" },
-                    "width": { "type": "number", "description": "Width in pixels" },
-                    "height": { "type": "number", "description": "Height in pixels" },
-                    "x": { "type": "number", "description": "X position" },
-                    "y": { "type": "number", "description": "Y position" }
-                }
+                    "name": { "type": "string", "description": "Name for the artboard (shown in the layer tree)." },
+                    "styles": {
+                        "type": "object",
+                        "properties": {
+                            "width": { "type": "string", "description": "Width of the artboard as a whole pixel value (e.g. \"1440px\")." },
+                            "height": { "type": "string", "description": "Height of the artboard as a whole pixel value (e.g. \"900px\")." }
+                        },
+                        "required": ["width", "height"],
+                        "description": "CSS styles for the artboard as a JSON object. Must include width and height as whole-pixel values."
+                    }
+                },
+                "required": ["name", "styles"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1279,25 +1642,35 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "nodeIds": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Array of node IDs to delete"
                     }
                 },
-                "required": ["node_ids"]
+                "required": ["nodeIds"]
             }),
         ).with_annotations(destructive()),
         tool(
             "set_text_content",
-            "Set the text content of a text node.",
+            "Set the text content of one or more text nodes.",
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The text node ID" },
-                    "text": { "type": "string", "description": "The new text content" }
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "nodeId": { "type": "string" },
+                                "textContent": { "type": "string" }
+                            },
+                            "required": ["nodeId", "textContent"]
+                        },
+                        "description": "Array of {nodeId, textContent} pairs"
+                    }
                 },
-                "required": ["node_id", "text"]
+                "required": ["updates"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1306,20 +1679,20 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "renames": {
+                    "updates": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "node_id": { "type": "string" },
+                                "nodeId": { "type": "string" },
                                 "name": { "type": "string" }
                             },
-                            "required": ["node_id", "name"]
+                            "required": ["nodeId", "name"]
                         },
-                        "description": "Array of {node_id, name} pairs"
+                        "description": "Array of {nodeId, name} pairs"
                     }
                 },
-                "required": ["renames"]
+                "required": ["updates"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1333,12 +1706,15 @@ fn build_static_tools() -> Vec<Tool> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "node_id": { "type": "string" },
+                                "nodeIds": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
                                 "styles": { "type": "object" }
                             },
-                            "required": ["node_id", "styles"]
+                            "required": ["nodeIds", "styles"]
                         },
-                        "description": "Array of {node_id, styles} pairs"
+                        "description": "Array of {nodeIds, styles} pairs"
                     }
                 },
                 "required": ["updates"]
@@ -1350,13 +1726,20 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "nodes": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of node IDs to duplicate"
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "parentId": { "type": "string" }
+                            },
+                            "required": ["id"]
+                        },
+                        "description": "Array of {id, parentId?} objects"
                     }
                 },
-                "required": ["node_ids"]
+                "required": ["nodes"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1365,15 +1748,23 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "moves": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of node IDs to move"
-                    },
-                    "parent_id": { "type": "string", "description": "The target parent node ID" },
-                    "index": { "type": "number", "description": "Position index within the parent" }
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "nodeId": { "type": "string" },
+                                "parentId": { "type": "string" },
+                                "before": { "type": "string" },
+                                "after": { "type": "string" },
+                                "index": { "type": "number" }
+                            },
+                            "required": ["nodeId"]
+                        },
+                        "description": "Array of move operations. Each has nodeId plus a placement: {parentId, index?}, {before}, or {after}."
+                    }
                 },
-                "required": ["node_ids", "parent_id"]
+                "required": ["moves"]
             }),
         ).with_annotations(destructive()),
         tool(
@@ -1382,7 +1773,7 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "nodeIds": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Array of node IDs you were working on"
@@ -1396,15 +1787,9 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of node IDs to export"
-                    },
-                    "format": { "type": "string", "enum": ["png", "jpeg", "svg", "pdf", "webp"] },
-                    "scale": { "type": "number", "description": "Scale factor for the export" }
-                },
-                "required": ["node_ids"]
+                    "type": { "type": "string", "enum": ["image", "video"], "description": "Export type" },
+                    "nodes": { "description": "Either \"nodes-with-exports-only\" or a record of node IDs to export configs." }
+                }
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1413,13 +1798,14 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_ids": {
+                    "nodeIds": {
                         "type": "array",
                         "items": { "type": "string" },
+                        "minItems": 1,
                         "description": "Array of node IDs to include in the PDF"
                     }
                 },
-                "required": ["node_ids"]
+                "required": ["nodeIds"]
             }),
         ).with_annotations(read_only()),
         tool(
@@ -1428,7 +1814,13 @@ fn build_static_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "filter": { "type": "string", "description": "Optional filter for token names" }
+                    "types": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional filter by token types"
+                    },
+                    "namePattern": { "type": "string", "description": "Optional name pattern to filter tokens" },
+                    "format": { "type": "string", "enum": ["json", "css", "tailwind"], "description": "Output format" }
                 }
             }),
         ).with_annotations(read_only()),
@@ -1443,11 +1835,12 @@ fn build_static_tools() -> Vec<Tool> {
                         "items": {
                             "type": "object",
                             "properties": {
+                                "type": { "type": "string" },
                                 "name": { "type": "string" },
                                 "value": { "type": "string" },
-                                "type": { "type": "string" }
+                                "description": { "type": "string" }
                             },
-                            "required": ["name", "value"]
+                            "required": ["type", "name", "value"]
                         },
                         "description": "Array of tokens to create"
                     }
@@ -1467,9 +1860,12 @@ fn build_static_tools() -> Vec<Tool> {
                             "type": "object",
                             "properties": {
                                 "name": { "type": "string" },
-                                "value": { "type": "string" }
+                                "newName": { "type": "string" },
+                                "value": { "type": "string" },
+                                "description": { "type": "string" },
+                                "delete": { "type": "boolean" }
                             },
-                            "required": ["name", "value"]
+                            "required": ["name"]
                         },
                         "description": "Array of token updates"
                     }

@@ -52,14 +52,25 @@ fn main() {
     // tokio runtime here because Tauri hasn't built one yet (it creates
     // its own when you call .build()/.run()).
     //
+    // This process acts as a thin PROXY: it speaks MCP over stdio to the
+    // AI client (Claude Code, Cursor, etc.) and forwards tool calls via
+    // HTTP to the running Deckle Desktop GUI process's internal REST
+    // endpoints at localhost:{mcp_port}/internal/*.
+    //
     // tracing output goes to stderr by default, which is correct for
     // stdio MCP (stdout is reserved for JSON-RPC messages).
     if cli.mcp {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
             use rmcp::ServiceExt;
-            let handler = mcp_server::create_standalone_handler().await;
-            tracing::info!("Deckle MCP server running over stdio");
+
+            // Try to connect to the running GUI's MCP server. Wait up to
+            // 10 seconds — the user may have just launched both processes.
+            let handler = mcp_server::create_proxy_handler(mcp_port, 10).await;
+            tracing::info!(
+                "Deckle MCP server running over stdio (proxying to GUI at port {})",
+                mcp_port
+            );
             match handler.serve(rmcp::transport::io::stdio()).await {
                 Ok(service) => {
                     let _ = service.waiting().await;
