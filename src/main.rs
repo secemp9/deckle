@@ -1089,7 +1089,7 @@ fn __mcp_callback(
 /// preload script calls this Tauri command to read HTML directly from the
 /// system clipboard when `clipboardData.getData("text/html")` returns empty.
 /// This is critical for copy-paste from the Deckle Chrome extension, which
-/// writes `<x-paper-html>...</x-paper-html>` to the clipboard.
+/// writes `<x-deckle-html>...</x-deckle-html>` to the clipboard.
 #[tauri::command]
 fn read_clipboard_html() -> Option<String> {
     match arboard::Clipboard::new() {

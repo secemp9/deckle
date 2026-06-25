@@ -96155,10 +96155,10 @@ const ZXe = Se(({ editorState: e, nodes: t }) => {
     tokens: pe.Optional(pe.Record(pe.String(), Roe)),
   }),
   JXe = '<meta charset="utf-8">',
-  ZC = '<!--<paper-paste-start data-embed="',
-  mde = '"></paper-paste-start>-->',
-  jA = "<x-paper-html>",
-  eKe = "</x-paper-html>";
+  ZC = '<!--<deckle-paste-start data-embed="',
+  mde = '"></deckle-paste-start>-->',
+  jA = "<x-deckle-html>",
+  eKe = "</x-deckle-html>";
 function tKe(e, t) {
   const n = `${ZC}${e}${mde}`,
     r =
@@ -102987,7 +102987,7 @@ function B8(e, t) {
   if (e instanceof Text || (e instanceof HTMLElement && e.tagName === "BR"))
     return !0;
   if (e instanceof HTMLElement && vb(e)) {
-    const n = e.getAttribute("paper-snapshot-original-tag") || e.tagName;
+    const n = e.getAttribute("deckle-snapshot-original-tag") || e.tagName;
     return sJe.has(n) ? !1 : Array.from(e.childNodes).every((r) => B8(r));
   }
   if (
@@ -103394,7 +103394,7 @@ async function TJe(e, t) {
       }
     } else if (
       g instanceof HTMLElement &&
-      g.tagName.toLowerCase() === "x-paper-clone"
+      g.tagName.toLowerCase() === "x-deckle-clone"
     ) {
       const A = g.getAttribute("node-id");
       if (!A) continue;
